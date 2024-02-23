@@ -311,20 +311,19 @@ configs = [
         x_vals=[2**i for i in range(10, 15)],
         line_arg="provider",
         line_vals=["triton", "flash"],
-        line_names=["Triton, Flash"],
+        line_names=["Triton", "Flash"],
         styles=[("red", "-"), ("blue", "-")],
         ylabel="ms",
-        plot_name=f"fused-attention-batch{BATCH}-head{N_HEADS}-d{D_HEAD}-{mode}",
+        plot_name=f"fused-attention-batch{BATCH}-head{N_HEADS}-d{D_HEAD}-fwd",
         args={
             "H": N_HEADS,
             "BATCH": BATCH,
             "D_HEAD": D_HEAD,
             "dtype": torch.float16,
-            "mode": mode,
+            "mode": "fwd",
             "causal": causal,
         },
     )
-    for mode in ["fwd"]
     for causal in [False, True]
 ]
 
@@ -344,39 +343,33 @@ def bench_flash_attention(
     warmup = 25
     rep = 100
 
-    if provider == "triton":
-        q = torch.randn(
-            (BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True
-        )
-        k = torch.randn(
-            (BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True
-        )
-        v = torch.randn(
-            (BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True
-        )
-        sm_scale = 1.3
-        fn = lambda: attention(q, k, v, causal, sm_scale)  # noqa: E731
+    q = torch.randn(
+        (BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True
+    )
+    k = torch.randn(
+        (BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True
+    )
+    v = torch.randn(
+        (BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True
+    )
 
-    if provider == "flash":
-        q = torch.randn(
-            (BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True
-        )
-        k = torch.randn(
-            (BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True
-        )
-        v = torch.randn(
-            (BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True
-        )
-        sm_scale = 1.3
+    sm_scale = 1.3
+
+    if provider == "triton":
+        fn = lambda: attention(q, k, v, causal, sm_scale)  # noqa: E731
+    else:
         fn = lambda: torch.nn.functional.scaled_dot_product_attention(  # noqa: E731
             q, k, v, is_causal=causal, scale=sm_scale
         )
+
+    # Benchmark
     ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
 
     flops_per_matmul = 2.0 * BATCH * H * N_CTX * N_CTX * D_HEAD
     total_flops = 2 * flops_per_matmul
     if causal:
         total_flops *= 0.5
+
     return total_flops / ms * 1e-9
 
 
