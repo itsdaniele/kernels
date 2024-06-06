@@ -192,8 +192,8 @@ def _fwd_kernel(
     rstd = 1 / tl.sqrt(var + eps)
 
     # store mean and rstd.
-    tl.store(Mean_query + off_hz * N_CTX + offs_m, mean)
-    tl.store(Rstd_query + off_hz * N_CTX + offs_m, rstd)
+    # tl.store(Mean_query + off_hz * N_CTX + offs_m, mean)
+    # tl.store(Rstd_query + off_hz * N_CTX + offs_m, rstd)
 
     # normalize q and apply linear transformation.
 
@@ -201,6 +201,10 @@ def _fwd_kernel(
 
     W_query = tl.load(W_query + tl.arange(0, BLOCK_DMODEL))
     B_query = tl.load(B_query + tl.arange(0, BLOCK_DMODEL))
+
+    W_key = tl.load(W_key + tl.arange(0, BLOCK_DMODEL))
+    B_key = tl.load(B_key + tl.arange(0, BLOCK_DMODEL))
+
     q = (q - mean[:, None]) * rstd[:, None] * W_query + B_query
 
     ###########
@@ -215,6 +219,16 @@ def _fwd_kernel(
         start_n = tl.multiple_of(start_n, BLOCK_N)
         # -- compute qk ----
         k = tl.load(K_block_ptr)  # load block of keys. Shape is (BLOCK_DMODEL, BLOCK_N)
+
+        # normalize k
+        mean = tl.sum(k, axis=1) / N_key
+        diff = k - mean[:, None]
+        diff_squared = diff * diff
+        var = tl.sum(diff_squared, axis=1) / N_key
+
+        rstd = 1 / tl.sqrt(var + eps)
+        k = (k - mean[:, None]) * rstd[:, None] * W_key + B_key
+
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, k)
         if MODE == 1 or MODE == 3:  # causal masking within the block
@@ -405,12 +419,12 @@ def test_op(Z, H, N_CTX, D_HEAD, causal, dtype=torch.float16):
     weight_key = torch.rand(w_shape, dtype=dtype, device="cuda", requires_grad=True)
     bias_key = torch.rand(w_shape, dtype=dtype, device="cuda", requires_grad=True)
 
-    # initialized a layernorm layer and assign the weights and biases, eps to the layer.
-    q_norm = torch.nn.LayerNorm(D_HEAD, eps=eps).to("cuda")
+    # # initialized a layernorm layer and assign the weights and biases, eps to the layer.
+    # q_norm = torch.nn.LayerNorm(D_HEAD, eps=eps).to("cuda")
 
-    # assign the weights and biases to the layer.
-    q_norm.weight = torch.nn.Parameter(weight_query)
-    q_norm.bias = torch.nn.Parameter(bias_query)
+    # # assign the weights and biases to the layer.
+    # q_norm.weight = torch.nn.Parameter(weight_query)
+    # q_norm.bias = torch.nn.Parameter(bias_query)
 
     sm_scale = 0.5
     # reference implementation
@@ -420,9 +434,9 @@ def test_op(Z, H, N_CTX, D_HEAD, causal, dtype=torch.float16):
     # std = 1 / (var + eps).sqrt()
     # q = (q - mean) * std
 
-    q_normalized = q_norm(q)
+    # q_normalized = q_norm(q)
     M = torch.tril(torch.ones((N_CTX, N_CTX), device="cuda"))
-    p = torch.matmul(q_normalized, k.transpose(2, 3)) * sm_scale
+    p = torch.matmul(q, k.transpose(2, 3)) * sm_scale
     if causal:
         p[:, :, M == 0] = float("-inf")
     p = torch.softmax(p.float(), dim=-1).half()
@@ -521,7 +535,7 @@ def bench_flash_attention(
     return total_flops / ms * 1e-9
 
 
-# test_op(6, 9, 1024, 64, False, dtype=torch.float16)
+test_op(6, 9, 1024, 64, False, dtype=torch.float16)
 # bench_flash_attention.run(save_path=".", print_data=True)
 
 # run test

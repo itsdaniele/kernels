@@ -12,52 +12,12 @@ import torch
 import triton
 import triton.language as tl
 
-from flash_attn_v1 import attention as attention_v1
 
-
-# We don't run auto-tuning every time to keep the tutorial fast. Uncommenting
-# the code below and commenting out the equivalent parameters is convenient for
-# re-tuning.
-# @triton.autotune(
-#     configs=[
-#         triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_stages=4, num_warps=8),
-#         triton.Config({"BLOCK_M": 256, "BLOCK_N": 64}, num_stages=3, num_warps=8),
-#         triton.Config({"BLOCK_M": 256, "BLOCK_N": 32}, num_stages=3, num_warps=8),
-#         triton.Config({"BLOCK_M": 256, "BLOCK_N": 32}, num_stages=3, num_warps=4),
-#         triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_stages=3, num_warps=4),
-#         triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_stages=4, num_warps=4),
-#         triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_stages=3, num_warps=4),
-#         triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_stages=4, num_warps=4),
-#         triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_stages=3, num_warps=8),
-#         triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_stages=7, num_warps=8),
-#         triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_stages=7, num_warps=8),
-#         triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_stages=6, num_warps=8),
-#         triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_stages=5, num_warps=8),
-#         triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_stages=4, num_warps=8),
-#         triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_stages=6, num_warps=4),
-#     ],
-#     key=["N_CTX"],
-# )
 @triton.jit
 def _fwd_kernel(
     Q,
     K,
     V,
-    ######### Layer norm stuff.
-    W_query,  # pointer to the layer norm weights
-    B_query,  # pointer to the  layer norm biases
-    Mean_query,  # pointer to the mean
-    Rstd_query,  # pointer to the 1/std
-    stride_layernorm_query,  # how much to increase the pointer when moving by 1 row for layer norm
-    N_query,  # number of columns in X
-    W_key,  # pointer to the layer norm weights
-    B_key,  # pointer to the  layer norm biases
-    Mean_key,  # pointer to the mean
-    Rstd_key,  # pointer to the 1/std
-    stride_layernorm_key,  # how much to increase the pointer when moving by 1 row for layer norm
-    N_key,  # number of columns in X
-    eps,  # epsilon to avoid division by zero in Layer norm.
-    ###########
     sm_scale,
     L,
     M,
@@ -179,38 +139,11 @@ def _fwd_kernel(
     q = tl.load(
         Q_block_ptr
     )  # load block of queries. This has shape (BLOCK_M, BLOCK_DMODEL).
-
-    ######### Layer-normalize the queries.
-
-    # q has shape (BLOCK_M, BLOCK_DMODEL). We want to normalize along the second axis.
-
-    mean = tl.sum(q, axis=1) / N_query
-    diff = q - mean[:, None]
-    diff_squared = diff * diff
-    var = tl.sum(diff_squared, axis=1) / N_query
-
-    rstd = 1 / tl.sqrt(var + eps)
-
-    # store mean and rstd.
-    tl.store(Mean_query + off_hz * N_CTX + offs_m, mean)
-    tl.store(Rstd_query + off_hz * N_CTX + offs_m, rstd)
-
-    # normalize q and apply linear transformation.
-
-    # load W and B
-
-    W_query = tl.load(W_query + tl.arange(0, BLOCK_DMODEL))
-    B_query = tl.load(B_query + tl.arange(0, BLOCK_DMODEL))
-    q = (q - mean[:, None]) * rstd[:, None] * W_query + B_query
-
-    ###########
-
     q = (q * qk_scale).to(tl.float16)
     # advance block pointers to first iteration of the loop
     K_block_ptr = tl.advance(K_block_ptr, (0, lo))
     V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
     # loop over k, v and update accumulator
-
     for start_n in range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         # -- compute qk ----
@@ -258,30 +191,12 @@ def _fwd_kernel(
 
 class _attention(torch.autograd.Function):
     @staticmethod
-    def forward(
-        ctx,
-        q,
-        k,
-        v,
-        causal,
-        sm_scale,
-        weight_query,
-        bias_query,
-        weight_key,
-        bias_key,
-        eps=1e-5,
-    ):
-        # BLOCK = 64
+    def forward(ctx, q, k, v, causal, sm_scale):
+        BLOCK = 64
         # shape constraints
         Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
         assert Lq == Lk and Lk == Lv
         assert Lk in {16, 32, 64, 128}
-
-        BLOCK_M = 128
-        BLOCK_N = 64 if Lk <= 64 else 32
-        num_stages = 4 if Lk <= 64 else 3
-        num_warps = 4
-
         o = torch.empty_like(q)
 
         # According to this, we have ceil(N_CTX/128) programs running, and tl.program_id(0) tells us on which one we are in.
@@ -300,41 +215,11 @@ class _attention(torch.autograd.Function):
         else:
             modes = [0]
 
-        q_arg = q.reshape(-1, q.shape[-1])
-        M_query, N_query = q_arg.shape
-        mean_query = torch.empty((M_query,), dtype=torch.float32, device="cuda")
-        rstd_query = torch.empty((M_query,), dtype=torch.float32, device="cuda")
-
-        # same for k
-        k_arg = k.reshape(-1, k.shape[-1])
-        M_key, N_key = k_arg.shape
-        mean_key = torch.empty((M_key,), dtype=torch.float32, device="cuda")
-        rstd_key = torch.empty((M_key,), dtype=torch.float32, device="cuda")
-
         for mode in modes:
             _fwd_kernel[grid](
                 q,
                 k,
                 v,
-                ######### Layer norm stuff.
-                weight_query,  # pointer to the layer norm weights
-                bias_query,  # pointer to the  layer norm biases
-                mean_query,  # pointer to the mean
-                rstd_query,  # pointer to the 1/std
-                q_arg.stride(
-                    0
-                ),  # how much to increase the pointer when moving by 1 row for layer norm
-                N_query,  # number of columns in X
-                weight_key,  # pointer to the layer norm weights
-                bias_key,  # pointer to the  layer norm biases
-                mean_key,  # pointer to the mean
-                rstd_key,  # pointer to the 1/std
-                k_arg.stride(
-                    0
-                ),  # how much to increase the pointer when moving by 1 row for layer norm
-                N_key,
-                eps,  # epsilon to avoid division by zero in Layer norm.
-                ###########
                 sm_scale,
                 L,
                 m,
@@ -358,12 +243,12 @@ class _attention(torch.autograd.Function):
                 q.shape[0],
                 q.shape[1],
                 q.shape[2],
-                BLOCK_M=BLOCK_M,
-                BLOCK_N=BLOCK_N,
+                BLOCK_M=128,
+                BLOCK_N=BLOCK,
                 BLOCK_DMODEL=Lk,
                 MODE=mode,
                 num_warps=num_warps,
-                num_stages=num_stages,
+                num_stages=2,
             )
 
         ctx.save_for_backward(q, k, v, o, L, m)
@@ -396,47 +281,22 @@ def test_op(Z, H, N_CTX, D_HEAD, causal, dtype=torch.float16):
         .normal_(mean=0.0, std=0.5)
         .requires_grad_()
     )
-
-    w_shape = (D_HEAD,)
-    weight_query = torch.rand(w_shape, dtype=dtype, device="cuda", requires_grad=True)
-    bias_query = torch.rand(w_shape, dtype=dtype, device="cuda", requires_grad=True)
-    eps = 1e-5
-
-    weight_key = torch.rand(w_shape, dtype=dtype, device="cuda", requires_grad=True)
-    bias_key = torch.rand(w_shape, dtype=dtype, device="cuda", requires_grad=True)
-
-    # initialized a layernorm layer and assign the weights and biases, eps to the layer.
-    q_norm = torch.nn.LayerNorm(D_HEAD, eps=eps).to("cuda")
-
-    # assign the weights and biases to the layer.
-    q_norm.weight = torch.nn.Parameter(weight_query)
-    q_norm.bias = torch.nn.Parameter(bias_query)
-
     sm_scale = 0.5
     # reference implementation
-
-    # mean = q.mean(dim=-1, keepdim=True)
-    # var = (q - mean).pow(2).mean(dim=-1, keepdim=True)
-    # std = 1 / (var + eps).sqrt()
-    # q = (q - mean) * std
-
-    q_normalized = q_norm(q)
     M = torch.tril(torch.ones((N_CTX, N_CTX), device="cuda"))
-    p = torch.matmul(q_normalized, k.transpose(2, 3)) * sm_scale
+    p = torch.matmul(q, k.transpose(2, 3)) * sm_scale
     if causal:
         p[:, :, M == 0] = float("-inf")
     p = torch.softmax(p.float(), dim=-1).half()
     # p = torch.exp(p)
     ref_out = torch.matmul(p, v)
     # triton implementation
-    tri_out = attention(
-        q, k, v, causal, sm_scale, weight_query, bias_query, weight_key, bias_key, eps
-    ).half()
+    tri_out = attention(q, k, v, causal, sm_scale).half()
     # compare
     assert torch.allclose(ref_out, tri_out, atol=1e-2, rtol=0)
 
 
-BATCH, N_HEADS, N_CTX, D_HEAD = 1, 16, 2048, 64
+BATCH, N_HEADS, N_CTX, D_HEAD = 4, 48, 4096, 64
 # vary seq length for fixed head and batch=4
 configs = [
     triton.testing.Benchmark(
@@ -444,9 +304,9 @@ configs = [
         x_vals=[2**i for i in range(10, 15)],
         line_arg="provider",
         line_vals=["triton", "flash"],
-        line_names=["Fused Q norm", "Not fused Q norm"],
+        line_names=["Triton", "Flash"],
         styles=[("red", "-"), ("blue", "-")],
-        ylabel="TFLOPS",
+        ylabel="ms",
         plot_name=f"fused-attention-batch{BATCH}-head{N_HEADS}-d{D_HEAD}-fwd",
         args={
             "H": N_HEADS,
@@ -487,41 +347,23 @@ def bench_flash_attention(
     )
 
     sm_scale = 1.3
-    weight = torch.rand(D_HEAD, dtype=dtype, device="cuda", requires_grad=True)
-    bias = torch.rand(D_HEAD, dtype=dtype, device="cuda", requires_grad=True)
-
-    def fn_notfused(q):
-        q = torch.nn.functional.layer_norm(
-            q, (D_HEAD,), weight=weight, bias=bias, eps=1e-5
-        )
-        return attention_v1(q, k, v, causal, sm_scale)
-
-    def fn_fused(q):
-        return attention(q, k, v, causal, sm_scale, weight, bias, weight, bias, 1e-5)
 
     if provider == "triton":
-        fn = lambda: fn_fused(q)
+        fn = lambda: attention(q, k, v, causal, sm_scale)  # noqa: E731
     else:
-        fn = lambda: fn_notfused(q)
+        fn = lambda: torch.nn.functional.scaled_dot_product_attention(  # noqa: E731
+            q, k, v, is_causal=causal, scale=sm_scale
+        )
 
     # Benchmark
     ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
 
     flops_per_matmul = 2.0 * BATCH * H * N_CTX * N_CTX * D_HEAD
     total_flops = 2 * flops_per_matmul
-
-    # add layernorm flops
-    total_flops += 4 * BATCH * H * N_CTX * D_HEAD
-
     if causal:
         total_flops *= 0.5
-
-    # compute tokens per second.
 
     return total_flops / ms * 1e-9
 
 
-# test_op(6, 9, 1024, 64, False, dtype=torch.float16)
 # bench_flash_attention.run(save_path=".", print_data=True)
-
-# run test
