@@ -192,16 +192,21 @@ def _fwd_kernel(
 class _attention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, causal, sm_scale):
-        BLOCK = 64
+        #BLOCK = 64
         # shape constraints
         Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
         assert Lq == Lk and Lk == Lv
         assert Lk in {16, 32, 64, 128}
+
+        BLOCK_M = 64
+        BLOCK_N = 64 if Lk <= 64 else 32
+        num_stages = 4 if Lk <= 64 else 3
+
         o = torch.empty_like(q)
 
         # According to this, we have ceil(N_CTX/128) programs running, and tl.program_id(0) tells us on which one we are in.
         # For each of those, we have one program running for every head in the batch. tl.program_id(1) allows us to access those.
-        grid = (triton.cdiv(q.shape[2], 128), q.shape[0] * q.shape[1], 1)
+        grid = (triton.cdiv(q.shape[2], BLOCK_M), q.shape[0] * q.shape[1], 1)
         L = torch.empty(
             (q.shape[0] * q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32
         )
@@ -243,12 +248,12 @@ class _attention(torch.autograd.Function):
                 q.shape[0],
                 q.shape[1],
                 q.shape[2],
-                BLOCK_M=128,
-                BLOCK_N=BLOCK,
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
                 BLOCK_DMODEL=Lk,
                 MODE=mode,
                 num_warps=num_warps,
-                num_stages=2,
+                num_stages=num_stages,
             )
 
         ctx.save_for_backward(q, k, v, o, L, m)

@@ -208,13 +208,13 @@ def run_benchmark():
 
     # Hyperparameters
     emb_size = 512
-    num_layers = 24
+    num_layers = 12
     num_heads = 4
     vocab_size = 512
-    max_length = 8192
+    max_length = 4096
     forward_expansion = 2
 
-    batch_sizes = [1, 2, 4]
+    batch_sizes = [1,4]
 
     variants = ["standard", "queries_keys", "no_layer_norm", "fused_q_norm"]
     # variants = ["queries_keys", "fused_q_norm"]
@@ -239,7 +239,7 @@ def run_benchmark():
             )
             model.device = device
             avg_time_per_token, tokens_per_second = benchmark_model(
-                model, input_data_shape, vocab_size, num_trials=10
+                model, input_data_shape, vocab_size, num_trials=50
             )
 
             # Make avg time per token in ms

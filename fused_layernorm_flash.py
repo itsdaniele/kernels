@@ -277,7 +277,7 @@ class _attention(torch.autograd.Function):
         assert Lq == Lk and Lk == Lv
         assert Lk in {16, 32, 64, 128}
 
-        BLOCK_M = 128
+        BLOCK_M = 64
         BLOCK_N = 64 if Lk <= 64 else 32
         num_stages = 4 if Lk <= 64 else 3
         num_warps = 4
@@ -286,7 +286,7 @@ class _attention(torch.autograd.Function):
 
         # According to this, we have ceil(N_CTX/128) programs running, and tl.program_id(0) tells us on which one we are in.
         # For each of those, we have one program running for every head in the batch. tl.program_id(1) allows us to access those.
-        grid = (triton.cdiv(q.shape[2], 128), q.shape[0] * q.shape[1], 1)
+        grid = (triton.cdiv(q.shape[2], BLOCK_M), q.shape[0] * q.shape[1], 1)
         L = torch.empty(
             (q.shape[0] * q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32
         )
